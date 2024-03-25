@@ -9,7 +9,6 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "Internationalization/Internationalization.h"
 #include "Misc/ScopedSlowTask.h"
-#include "Developer/AssetTools/Private/SPackageReportDialog.h"
 #include "ISourceControlModule.h"
 #include "SourceControlOperations.h"
 #include "Logging/LogMacros.h"
@@ -23,9 +22,9 @@
 #include "Materials/MaterialInterface.h"
 #include "Engine/World.h"
 #include "Engine/StaticMesh.h"
-#include "Misc/FileHelper.h"
 #include "Templates/SharedPointer.h"
 #include "EditorAssetLibrary.h"
+#include "EditorStaticMeshLibrary.h"
 #include "Engine/Blueprint.h"
 #include "Serialization/MemoryWriter.h"
 #include "UObject/UObjectGlobals.h"
@@ -34,17 +33,19 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "Engine/SCS_Node.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/MorphTarget.h"
-#include "AnimationRuntime.h"
 #include "Components/SkinnedMeshComponent.h"
 #include "Modules/ModuleManager.h"
 #include "AssetToolsModule.h"
 #include "Dialogs/DlgPickAssetPath.h"
-#include "RawMesh.h"
 #include "SkeletalRenderPublic.h"
 #include "Rendering/SkeletalMeshRenderData.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "EditorLevelLibrary.h"
+#include "JsonObjectConverter.h"
 #include "Engine/StaticMeshActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "GameFramework/Character.h"
@@ -54,26 +55,46 @@
 #include "StaticMeshAttributes.h"
 #include "MeshOpsActor.h"
 #include "KismetProceduralMeshLibrary.h"
+#include "Animation/SkeletalMeshActor.h"
+#include "HAL/FileManagerGeneric.h"
+#include "Kismet/KismetSystemLibrary.h"
+#include "Misc/FileHelper.h"
+
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 3
+#include "Engine/SkinnedAssetCommon.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "Developer/AssetTools/Private/SPackageReportDialog.h"
+#include "RawMesh.h"
+#include "StaticMeshEditorSubsystem.h"
+
+#include "Subsystems/UnrealEditorSubsystem.h"
+
+#include "Misc/FileHelper.h"
+#include "AnimationRuntime.h"
 #include "MaterialDomain.h"
 #include "VectorTypes.h"
-#include "Engine/SkinnedAssetCommon.h"
-#if ENGINE_MAJOR_VERSION >= 5
-#include "StaticMeshEditorSubsystem.h"
+#else
+#include "AssetTools/Private/SPackageReportDialog.h"
+#include "RawMesh/Public/RawMesh.h"
+#endif
+
+#if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION < 3
+#include "StaticMeshEditor/Public/StaticMeshEditorSubsystem.h"
 #include "Subsystems/UnrealEditorSubsystem.h"
-#include "PhysicsEngine/BodySetup.h"
 #endif
 
 #define LOCTEXT_NAMESPACE "PakExport"
 
 static auto const Quotes{FString("\"")};
-constexpr auto SavedPostfix{".saved"};
 
 TArray<FAssetData> SelectedAssets;
-TArray<FString> SavedAssetsPaths;
+TMap<FString, TTuple<FString, TTuple<UObject*, UObject*>>> SavedAssetsPaths;
 TArray<FString> SimpleCollisionCreatedAssets;
 bool Started = false;
 bool MaterialsPakRequested = false;
 bool CamerasPakRequested = false;
+bool LevelSequencePakRequested = false;
+bool Archived = false;
 
 TMap<UObject*, TArray<FMeshDescription>> mesh_descs;
 TArray<UObject*> AssetsToDelete;
@@ -97,76 +118,160 @@ void UPakExportUtility::Export2Pak()
 	Export2Pak_Internal();
 }
 
+void UPakExportUtility::Export2PakArchived()
+{
+	Archived = true;
+	Export2Paks();
+	Archived = false;
+}
+
 void UPakExportUtility::Export2Paks()
 {
-	if (Started) return;
-
-	// Choose a destination folder
-	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
-	FString DestinationFile;
-	FString DestinationDir;
-	TArray<FString> DestinationFiles;
-	if (ensure(DesktopPlatform))
-	{
-		const void* ParentWindowWindowHandle = FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr);
-
-		const FString Title = LOCTEXT("MigrateToFolderTitle", "Choose a destination Content folder").ToString();
-		bool bFolderAccepted = false;
-		while (!bFolderAccepted)
-		{
-			const bool bFolderSelected = DesktopPlatform->SaveFileDialog(
-				ParentWindowWindowHandle,
-				Title,
-				FEditorDirectories::Get().GetLastDirectory(ELastDirectory::GENERIC_EXPORT),
-				TEXT("Exported.pak"),
-				TEXT("Pak Files (*.pak)|*.pak"),
-				EFileDialogFlags::None,
-				DestinationFiles
-			);
-
-			if (!bFolderSelected)
-			{
-				// User canceled, return
-				UE_LOG(LogPakExport, Error, TEXT("User canceled, return!"));
-				return;
-			}
-
-			DestinationFile = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*DestinationFiles[0]);
-			DestinationDir = FPaths::GetPath(DestinationFile);
-
-			FEditorDirectories::Get().SetLastDirectory(ELastDirectory::GENERIC_EXPORT, DestinationDir);
-			FPaths::NormalizeFilename(DestinationFile);
-
-			bFolderAccepted = true;
-		}
-	}
-	else
-	{
-		// Not on a platform that supports desktop functionality
-		FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("NoDesktopPlatform", "Error: This platform does not support a file dialog."));
-		UE_LOG(LogPakExport, Error, TEXT("This platform does not support a file dialog!"));
-		return;
-	}
-
+	const auto DestinationDir{GetDestinationFolder()};
 	for (const auto& Asset : UEditorUtilityLibrary::GetSelectedAssetData())
 		Export2Pak_Internal({Asset}, DestinationDir);
 }
 
 void UPakExportUtility::Export2MaterialsPak()
 {
-	if (Started) return;
 	MaterialsPakRequested = true;
 	Export2Pak();
 }
 
 void UPakExportUtility::Export2CamerasPak()
 {
-	if (Started) return;
 	CamerasPakRequested = true;
 	Export2Pak();
 }
 
-void UPakExportUtility::MakeBunchFromMorphs(FString SourcePakageName, FString MaterialPakageName, FString EdgeMaterialPakageName, FString SliceMaterialPakageName, FString SubstrateMaterialPakageName, FString DestinationPakageName, TArray<FMorphTargetData> MorphTargets, FVector2D Size, float Gap, FString Styling, bool OnlyCut)
+void UPakExportUtility::Export2LevelSequencePak()
+{
+	LevelSequencePakRequested = true;
+	Export2Pak_Internal();
+}
+
+void UPakExportUtility::Repack(FString Source, FString Dest)
+{
+	if (!SetStarted(true)) return;
+	
+	auto& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+	
+	const auto DestFolder{Source.IsEmpty() ? GetDestinationFolder() : Source};
+	const auto ExtractedFolder{DestFolder + "/Extracted"};
+	const auto NewDir{Dest.IsEmpty() ? GetDestinationFolder() : Dest};
+	
+	PlatformFile.DeleteDirectoryRecursively(*ExtractedFolder);
+
+	const auto ProcessFiles{[&PlatformFile, &ExtractedFolder, &NewDir](const FString& InDestFolder)
+	{
+		const auto PakEContent{
+			FPaths::GameSourceDir() + "../Plugins/PakExport/Utils/PakExport/Plugins/" +
+			UPakExportRuntimeStatic::PakExportName + "/Content/"
+		};
+		
+		auto RelDestFolder{InDestFolder};
+		FPaths::MakePathRelativeTo(RelDestFolder, *ExtractedFolder);
+		if (!RelDestFolder.IsEmpty()) RelDestFolder = RelDestFolder + "/";
+		
+		TArray<FString> Archs{};
+		PlatformFile.FindFiles(Archs, *InDestFolder, *FString("zip"));
+		for (const auto& Arch : Archs)
+		{
+			const auto AlreadyExtracted{FPaths::GetCleanFilename(Arch) == "source.zip"};
+			const auto ArchPath{FPaths::GetPath(Arch)};
+			const auto DestFolder{NewDir + "/" + RelDestFolder};
+			const auto ArchName{
+				AlreadyExtracted
+					? ParseStringToArray(ArchPath, "/").Last()
+					: FPaths::GetBaseFilename(Arch)
+			};
+			const auto ArchExtractedFolder{
+				AlreadyExtracted
+					? ExtractedFolder + "/" + RelDestFolder
+					: ExtractedFolder + "/" + RelDestFolder + ArchName
+			};
+			const auto Sources{ArchExtractedFolder + "/source"};
+
+			if (AlreadyExtracted) { if (FPaths::DirectoryExists(DestFolder)) continue; }
+			else { if (FPaths::FileExists(DestFolder + ArchName)) continue; }
+			
+			if (AlreadyExtracted)
+				PlatformFile.CopyDirectoryTree(*ArchExtractedFolder, *ArchPath, true);
+			else
+				UnZip(FPaths::GetBaseFilename(Arch, false), ArchExtractedFolder);
+
+			//Copy sources to PakE
+			UnZip(Sources, Sources);
+			PlatformFile.CopyDirectoryTree(*PakEContent, *Sources, true);
+			PlatformFile.DeleteDirectoryRecursively(*Sources);
+
+			if (CookPak(ArchExtractedFolder + "/asset.pak", {}, false))
+			{
+				FString String;
+				const auto Config{ArchExtractedFolder + "/config.json"};
+				if (FFileHelper::LoadFileToString(String, *Config))
+				{
+					FExportData ExportData;
+					if (FJsonObjectConverter::JsonObjectStringToUStruct(String, &ExportData))
+					{
+						if (ExportData.GetType() == EAssetType::product || ExportData.GetType() == EAssetType::environment)
+						{
+							FMaterialableExportData MaterialableExportData;
+							if (FJsonObjectConverter::JsonObjectStringToUStruct(String, &MaterialableExportData))
+							{
+								MaterialableExportData.UpdateEngineVersion();
+								FString JsonString;
+								if (FJsonObjectConverter::UStructToJsonObjectString(MaterialableExportData, JsonString))
+									FFileHelper::SaveStringToFile(JsonString, *Config);
+							}
+						}
+						else if (ExportData.GetType() == EAssetType::material)
+						{
+							ExportData.UpdateEngineVersion();
+							FString JsonString;
+							if (FJsonObjectConverter::UStructToJsonObjectString(ExportData, JsonString))
+								FFileHelper::SaveStringToFile(JsonString, *Config);
+						}
+						else
+						{
+							UE_LOG(LogPakExport, Error, TEXT("Wrong asset type %s for update unreal version!"),
+							       *UEnum::GetValueAsString(ExportData.GetType()));
+						}
+					}
+				}
+				
+				if (AlreadyExtracted)
+					PlatformFile.CopyDirectoryTree(*DestFolder, *ArchExtractedFolder, true);
+				else
+					Zip(ArchExtractedFolder, DestFolder + ArchName);
+			}
+			else
+			{
+				UE_LOG(LogPakExport, Error, TEXT("CookPak %s failed!"), *Arch);
+			}
+			
+			PlatformFile.DeleteDirectoryRecursively(*PakEContent);
+			PlatformFile.DeleteDirectoryRecursively(*ArchExtractedFolder);
+		}
+	}};
+
+	ProcessFiles(DestFolder);
+
+	FSimpleDirectoryVisitor SimpleDirectoryVisitor;
+	PlatformFile.IterateDirectoryRecursively(*DestFolder, SimpleDirectoryVisitor);
+	for (const auto& Directory : SimpleDirectoryVisitor.Directories)
+		if (!FPaths::IsSamePath(NewDir, Directory))
+			ProcessFiles(Directory);
+	
+	PlatformFile.DeleteDirectoryRecursively(*ExtractedFolder);
+	
+	SetStarted(false);
+}
+
+void UPakExportUtility::MakeBunchFromMorphs(FString SourcePakageName, FString MaterialPakageName,
+                                            FString SliceMaterialPakageName, FString SubstrateMaterialPakageName,
+                                            FString DestinationPakageName, TArray<FMorphTargetData> MorphTargets,
+                                            FVector2D Size, float Gap, FString Styling, bool OnlyCut)
 {
 	const auto& AssetRegistryModule = (FModuleManager::Get().LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"))).Get();
 
@@ -223,30 +328,13 @@ void UPakExportUtility::MakeBunchFromMorphs(FString SourcePakageName, FString Ma
 			return;
 		}
 
-		//set init mats
+		//EnableSimpleCollisions(TempSavedAssets);
+		//UEditorAssetLibrary::SaveLoadedAsset(SaveAssets[0].GetAsset(), false);
+
+		//Bunch of actors to static mesh
 		const auto TempStaticMesh = Cast<UStaticMesh>(TempSavedAssets[0].GetAsset());
 		SetAllowCPUAccess(World, TempStaticMesh);
 
-		TArray<FAssetData> SliceMatAssets;
-		AssetRegistryModule.GetAssetsByPackageName(FName(SliceMaterialPakageName), SliceMatAssets);
-		const auto SliceMat = Cast<UMaterialInterface>(SliceMatAssets[0].GetAsset());
-
-		TArray<FAssetData> SubstrateMatAssets;
-		AssetRegistryModule.GetAssetsByPackageName(FName(SubstrateMaterialPakageName), SubstrateMatAssets);
-		const auto SubstrateMat = Cast<UMaterialInterface>(SubstrateMatAssets[0].GetAsset());
-
-		constexpr auto EdgeMaterialSlotName = "EdgeMaterialSlot";
-
-		auto TempStaticMats = TempStaticMesh->GetStaticMaterials();
-		TempStaticMats[1] = (FStaticMaterial(nullptr, EdgeMaterialSlotName));
-		TempStaticMats[2] = (FStaticMaterial(SliceMat));
-		TempStaticMats[3] = (FStaticMaterial(SubstrateMat));
-		TempStaticMesh->SetStaticMaterials(TempStaticMats);
-
-		//EnableSimpleCollisions(TempSavedAssets);
-		UEditorAssetLibrary::SaveLoadedAsset(TempStaticMesh, false);
-
-		//Bunch of actors to static mesh
 		const auto BBX = TempStaticMesh->GetBounds().BoxExtent.X + Gap;
 		const auto BBY = TempStaticMesh->GetBounds().BoxExtent.Y + Gap;
 
@@ -280,18 +368,28 @@ void UPakExportUtility::MakeBunchFromMorphs(FString SourcePakageName, FString Ma
 
 			SavedStaticMesh = Cast<UStaticMesh>(FinalSaveAssets[0].GetAsset());
 
-			const auto Materials = GetBunchMaterials(MaterialPakageName);
-			const auto EdgeMaterials = GetBunchMaterials(EdgeMaterialPakageName);
-			auto SavedStaticMats = SavedStaticMesh->GetStaticMaterials();
-			for (auto& SavedStaticMat : SavedStaticMats)
+			TArray<UMaterialInterface*> Materials;
+			int32 MaterialCount = 0;
+			while (true)
 			{
-				if (SavedStaticMat.MaterialSlotName.ToString().Contains(EdgeMaterialSlotName))
-					SavedStaticMat = FStaticMaterial(EdgeMaterials[FMath::RandRange(0, Materials.Num() - 1)]);
-				else if (!SavedStaticMat.MaterialInterface)
-					SavedStaticMat = FStaticMaterial(Materials[FMath::RandRange(0, Materials.Num() - 1)]);
+				TArray<FAssetData> MaterialAssets;
+				AssetRegistryModule.GetAssetsByPackageName(
+				FName(MaterialCount == 0 ? MaterialPakageName : (MaterialPakageName + FString::FromInt(MaterialCount))), MaterialAssets);
+				if (MaterialAssets.Num() > 0)
+				{
+					Materials.Add(Cast<UMaterialInterface>(MaterialAssets[0].GetAsset()));
+					++MaterialCount;
+				}
+				else
+				{
+					break;
+				}
 			}
-				
-			SavedStaticMesh->SetStaticMaterials(SavedStaticMats);
+
+			TArray<FStaticMaterial> StaticMaterials;
+			for (int i = 0; i < SavedStaticMesh->GetNumSections(0); ++i)
+				StaticMaterials.Add(FStaticMaterial(Materials[FMath::RandRange(0, Materials.Num() - 1)]));
+			SavedStaticMesh->SetStaticMaterials(StaticMaterials);
 
 			SetAllowCPUAccess(World, SavedStaticMesh);
 
@@ -398,15 +496,14 @@ bool UPakExportUtility::SetStarted(bool Val)
 		//restore saved assets
 		for (const auto& SavedAssetPath : SavedAssetsPaths)
 		{
-			const auto AssetPath = SavedAssetPath.Replace(*FString(SavedPostfix), TEXT(""));
-			if (!IFileManager::Get().Move(*AssetPath, *SavedAssetPath))
+			if (ensure(UEditorAssetLibrary::ConsolidateAssets(SavedAssetPath.Value.Value.Value, {SavedAssetPath.Value.Value.Key})))
 			{
-				UE_LOG(LogPakExport, Error, TEXT("Failed to restore %s after set simple collisions!")
-				, *FPaths::GetBaseFilename(AssetPath));
+				UEditorAssetLibrary::DeleteAsset(SavedAssetPath.Key);
+				UEditorAssetLibrary::RenameAsset(SavedAssetPath.Value.Key, SavedAssetPath.Key);
 			}
 		}
 
-		for (auto A : AssetsToDelete)
+		for (const auto A : AssetsToDelete)
 			UEditorAssetLibrary::DeleteLoadedAsset(A);
 		
 		SelectedAssets.Empty();
@@ -419,6 +516,7 @@ bool UPakExportUtility::SetStarted(bool Val)
 #endif
 		MaterialsPakRequested = false;
 		CamerasPakRequested = false;
+		LevelSequencePakRequested = false;
 		Started = false;
 	}
 	return true;
@@ -427,10 +525,164 @@ bool UPakExportUtility::SetStarted(bool Val)
 bool UPakExportUtility::Prepare()
 {
 #if PLATFORM_WINDOWS
-	return RunBat("UnZip.bat");
+	return RunBat("UnZipPakE.bat");
 #elif PLATFORM_MAC
-	return RunBat("UnZip.sh");
+	return RunBat("UnZipPakE.sh");
 #endif
+}
+
+void UPakExportUtility::SaveAssetsCopy(const TArray<FAssetData>& InAssets)
+{
+	TArray<FName> PackageNames;
+	PackageNames.Reserve(InAssets.Num());
+	for (const auto& SelectedAsset : InAssets) PackageNames.Add(SelectedAsset.PackageName);
+
+	TSet<FName> AllPackageNamesToMove;
+	{
+		FScopedSlowTask SlowTask(PackageNames.Num(), LOCTEXT("MigratePackages_GatheringDependencies", "Gathering Dependencies..."));
+		SlowTask.MakeDialog();
+
+		for (const auto& PackageName : PackageNames)
+		{
+			SlowTask.EnterProgressFrame();
+
+			if (!AllPackageNamesToMove.Contains(PackageName))
+			{
+				TSet<FName> PackageNamesToMove;
+				AllPackageNamesToMove.Add(PackageName);
+				FString Path = PackageName.ToString();
+				FString OriginalRootString;
+				Path.RemoveFromStart(TEXT("/"));
+				Path.Split("/", &OriginalRootString, &Path, ESearchCase::IgnoreCase, ESearchDir::FromStart);
+				OriginalRootString = TEXT("/") + OriginalRootString;
+				RecursiveGetDependencies(PackageName, AllPackageNamesToMove, PackageNamesToMove, OriginalRootString);
+			}
+		}
+	}
+
+	const auto& AssetRegistryModule = (FModuleManager::Get().LoadModuleChecked<FAssetRegistryModule>(
+		TEXT("AssetRegistry"))).Get();
+	for (const auto& PackageNamesToMove : AllPackageNamesToMove)
+	{
+		TArray<FAssetData> Assets;
+		if (AssetRegistryModule.GetAssetsByPackageName(PackageNamesToMove, Assets))
+			for (auto const& SelectedAsset : Assets)
+				SaveAssetCopy(SelectedAsset);
+	}
+}
+
+void UPakExportUtility::SaveAssetCopy(const FAssetData& InAsset)
+{
+	const auto Path{InAsset.PackagePath.ToString() + "/" + InAsset.AssetName.ToString()};
+	constexpr auto SavedPrefix{"_Saved"};
+	const auto SavedPath{Path + SavedPrefix};
+	const auto Path2{Path.Replace(*FString(SavedPrefix), TEXT(""), ESearchCase::CaseSensitive)};
+	if (!SavedAssetsPaths.Contains(Path) && !SavedAssetsPaths.Contains(Path2))
+		if (const auto Duplicated = UEditorAssetLibrary::DuplicateAsset(Path, SavedPath))
+		{
+			TTuple<UObject*, UObject*> Objects(InAsset.GetAsset(), Duplicated);
+			TTuple<FString, TTuple<UObject*, UObject*>> Payload(SavedPath, Objects);
+			SavedAssetsPaths.Emplace(Path, Payload);
+		}
+}
+
+void UPakExportUtility::SaveAssetCopy(const UObject* InAsset)
+{
+	const auto& AssetRegistryModule = (FModuleManager::Get().LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"))).Get();
+	
+	const auto PackageName{InAsset->GetPathName().LeftChop(InAsset->GetName().Len() + 1)};
+	
+	TArray<FAssetData> Assets;
+	if (AssetRegistryModule.GetAssetsByPackageName(FName(PackageName), Assets))
+		for (const auto& Asset : Assets)
+			SaveAssetCopy(Asset);
+}
+
+void UPakExportUtility::MaterialSlotsUnification(const TArray<FAssetData>& InAssets)
+{
+	for (const auto InAsset : InAssets)
+	{
+		const auto Asset = InAsset.GetAsset();
+
+		if (const auto Mesh = Cast<UStaticMesh>(Asset))
+		{
+			SaveAssetCopy(InAsset);
+			for (auto& Material : Mesh->GetStaticMaterials())
+				Material.MaterialSlotName = FName(Material.MaterialSlotName.ToString() + "_" + Mesh->GetName());
+		}
+			
+
+		if (auto const Mesh = Cast<USkeletalMesh>(Asset))
+		{
+			SaveAssetCopy(InAsset);
+			for (auto& Material : Mesh->GetMaterials())
+				Material.MaterialSlotName = FName(Material.MaterialSlotName.ToString() + "_" + Mesh->GetName());
+		}
+		
+		if (const auto Blueprint = Cast<UBlueprint>(Asset))
+		{
+			for (const auto Node : Cast<UBlueprintGeneratedClass>(Blueprint->GeneratedClass)->
+			                       SimpleConstructionScript->GetAllNodes())
+			{
+				if (const auto StaticMeshComponent = Cast<UStaticMeshComponent>(Node->ComponentTemplate))
+					if (const auto StaticMesh = StaticMeshComponent->GetStaticMesh())
+					{
+						SaveAssetCopy(StaticMesh);
+						for (auto& Material : StaticMesh->GetStaticMaterials())
+							Material.MaterialSlotName = FName(Material.MaterialSlotName.ToString() + "_" + StaticMeshComponent->GetName());
+					}
+						
+
+				if (const auto SkeletalMeshComponent = Cast<USkeletalMeshComponent>(Node->ComponentTemplate))
+					if (const auto SkeletalMesh = SkeletalMeshComponent->SkeletalMesh)
+					{
+						SaveAssetCopy(SkeletalMesh);
+						for (auto& Material : SkeletalMesh->GetMaterials())
+							Material.MaterialSlotName = FName(
+								Material.MaterialSlotName.ToString() + "_" + SkeletalMeshComponent->GetName());
+					}
+			}
+		}
+
+		if (Asset->IsA(UWorld::StaticClass()))
+		{
+			const auto World = Cast<UWorld>(Asset);
+			TArray<AActor*> Actors;
+			for (int32 LevelIndex = 0; LevelIndex < World->GetNumLevels(); LevelIndex++)
+				Actors.Append(World->GetLevel(LevelIndex)->Actors);
+			for (const auto Actor : Actors)
+			{
+				if (Actor->IsA<AStaticMeshActor>()
+					|| Actor->IsA<ASkeletalMeshActor>()
+					|| (((UObject*)Actor->GetClass())->IsA<UBlueprintGeneratedClass>()))
+				{
+					Actor->ForEachComponent<UMeshComponent, TFunction<void(UMeshComponent*)>>(false
+						, [Actor](auto MeshComponent)
+						{
+							if (auto StaticMeshComponent = Cast<UStaticMeshComponent>(MeshComponent))
+								if (auto StaticMesh = StaticMeshComponent->GetStaticMesh())
+								{
+									SaveAssetCopy(StaticMesh);
+									for (auto& Material : StaticMesh->GetStaticMaterials())
+										Material.MaterialSlotName = FName(
+											Material.MaterialSlotName.ToString() + "_" + Actor->GetName() + "." +
+											StaticMeshComponent->GetName());
+								}
+							
+							if (auto SkeletalMeshComponent = Cast<USkeletalMeshComponent>(MeshComponent))
+								if (auto SkeletalMesh = SkeletalMeshComponent->SkeletalMesh)
+								{
+									SaveAssetCopy(SkeletalMesh);
+									for (auto& Material : SkeletalMesh->GetMaterials())
+										Material.MaterialSlotName = FName(
+											Material.MaterialSlotName.ToString() + "_" + Actor->GetName() + "." +
+											SkeletalMeshComponent->GetName());
+								}
+						});
+				}
+			}
+		}
+	}
 }
 
 bool UPakExportUtility::MigratePackages(const TArray<FAssetData>& InAssets/* = {}*/)
@@ -554,7 +806,7 @@ bool UPakExportUtility::MigratePackages(const TArray<FAssetData>& InAssets/* = {
 	for (const auto& SelectedAsset : l_SelectedAssets) PackageNames.Add(SelectedAsset.PackageName);
 
 	// Packages must be saved for the migration to work
-	if (!FEditorFileUtils::SaveDirtyPackages(true, true, true))
+	if (!FEditorFileUtils::SaveDirtyPackages(false, true, true, true))
 	{
 		UE_LOG(LogPakExport, Error, TEXT("Save pakages failed!"));
 		return false;
@@ -606,7 +858,7 @@ bool UPakExportUtility::MigratePackages(const TArray<FAssetData>& InAssets/* = {
 	const FText ReportMessage = LOCTEXT("MigratePackagesReportTitle", "The following assets will be migrated to another content folder.");
 	TSharedPtr<TArray<ReportPackageData>> ReportPackages = MakeShareable(new TArray<ReportPackageData>);
 	for (auto PackageIt = AllPackageNamesToMove.CreateConstIterator(); PackageIt; ++PackageIt)
-		ReportPackages.Get()->Add({ (*PackageIt).ToString(), true });
+		ReportPackages.Get()->Add({ PackageIt->ToString(), true });
 	MigratePackages_ReportConfirmed(ReportPackages);
 	return true;
 }
@@ -615,7 +867,7 @@ void UPakExportUtility::MigratePackages_ReportConfirmed(TSharedPtr<TArray<Report
 {
 	// Choose a destination folder
 	const auto GameDir = FPaths::GameSourceDir();
-	FString DestinationFolder{ GameDir + "../Plugins/PakExport/Utils/PakExport/Plugins/PakE/Content/"};
+	FString DestinationFolder{ GameDir + "../Plugins/PakExport/Utils/PakExport/Plugins/" + UPakExportRuntimeStatic::PakExportName + "/Content/"};
 
 	bool bUserCanceled = false;
 
@@ -769,7 +1021,7 @@ void UPakExportUtility::MigratePackages_ReportConfirmed(TSharedPtr<TArray<Report
 	MigrateLog.Notify(LogMessage, Severity, true);
 }
 
-bool UPakExportUtility::CookPak(const FString& InDestinationFile/* = {}*/)
+bool UPakExportUtility::CookPak(const FString& InDestinationFile, const FString& CustomFileName/* = {}*/, bool WithSources/* = true*/)
 {
 	const auto EngineDir = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(
 	*(FPaths::EngineSourceDir() + "/../"));
@@ -817,6 +1069,11 @@ bool UPakExportUtility::CookPak(const FString& InDestinationFile/* = {}*/)
 				FEditorDirectories::Get().SetLastDirectory(ELastDirectory::GENERIC_EXPORT, DestinationDir);
 				FPaths::NormalizeFilename(DestinationFile);
 
+				if (!CustomFileName.IsEmpty())
+				{
+					DestinationFile = DestinationDir + FString("/") + CustomFileName + FString(".pak");
+				}
+				
 				bFolderAccepted = true;
 			}
 		}
@@ -828,35 +1085,59 @@ bool UPakExportUtility::CookPak(const FString& InDestinationFile/* = {}*/)
 		}
 	}
 
-	UPakExportUtilityRuntime::GenerateJsonsForAssets(SelectedAssets, DestinationFile, MaterialsPakRequested, CamerasPakRequested);
+	const auto ArchivedTempDir = Archived ? UKismetSystemLibrary::GetProjectSavedDirectory() + "ArchivedTemp" : FString();
+
+	if (!ArchivedTempDir.IsEmpty())
+	{
+		auto& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+
+		if (PlatformFile.DirectoryExists(*ArchivedTempDir))
+		{
+			FFileManagerGeneric::Get().DeleteDirectory(*ArchivedTempDir, true, true);
+		}
+
+		if (!PlatformFile.DirectoryExists(*ArchivedTempDir))
+		{
+			FFileManagerGeneric::Get().MakeDirectory(*ArchivedTempDir, true);
+		}
+	}
+	
+	UPakExportUtilityRuntime::GenerateJsonsForAssets(SelectedAssets, DestinationFile, MaterialsPakRequested, CamerasPakRequested, LevelSequencePakRequested, ArchivedTempDir);
 
 	if (CamerasPakRequested) return true;
 	
 	const auto ContentFolder{ IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(
-	*(FPaths::GameSourceDir() + "../Plugins/PakExport/Utils/PakExport/Plugins/PakE/Content/"))};
+	*(FPaths::GameSourceDir() + "../Plugins/PakExport/Utils/PakExport/Plugins/" + UPakExportRuntimeStatic::PakExportName + "/Content/"))};
 	
 	//cook
+	const auto FinalDestinationFile{ArchivedTempDir.IsEmpty() ? DestinationFile : ArchivedTempDir + "/asset.pak"};
+	const auto FinalSourcePath{ArchivedTempDir.IsEmpty() ? FinalDestinationFile :  ArchivedTempDir + "/source"};
+	
 #if PLATFORM_WINDOWS
 	const auto Res = RunBat("CookAndPak.bat\" " + Quotes + EngineDir + Quotes
-	+ " " + Quotes + DestinationFile + Quotes
+	+ " " + Quotes + FinalDestinationFile + Quotes
 	+ " " + "1>" + Quotes + DestinationDir + FString("/") + "CookAndPak.log" + Quotes + "2>&1");
 
 	if (Res)
 	{
 		RunBat("PakE2Game.bat\" " + Quotes + ContentFolder + Quotes);
 		
-		RunBat("Zip.bat\" " + Quotes + DestinationFile + Quotes + " " + Quotes + ContentFolder + Quotes);
+		if (WithSources) RunBat("Zip.bat\" " + Quotes + FinalSourcePath + Quotes + " " + Quotes + ContentFolder + Quotes);
+		
+		if (!ArchivedTempDir.IsEmpty()) RunBat("Zip.bat\" " + Quotes + DestinationFile + Quotes + " " + Quotes + ArchivedTempDir + Quotes);
 	}
 	
 	return Res;
 #elif PLATFORM_MAC
-	const auto Res = RunBat("CookAndPak.sh " + EngineDir  + " " + DestinationFile);
+	const auto Res = RunBat("CookAndPak.sh " + EngineDir  + " " + FinalDestinationFile);
 
 	if (Res)
 	{
 		RunBat("PakE2Game.sh " + ContentFolder);
 		
-		RunBat("Zip.sh " + DestinationFile + " " + ContentFolder);
+		if (WithSources) RunBat("Zip.sh " + FinalSourcePath + " " + ContentFolder);
+
+		if (!ArchivedTempDir.IsEmpty()) RunBat("Zip.sh " + DestinationFile + " " + ArchivedTempDir);
 	}
 	
 	return Res;
@@ -897,26 +1178,17 @@ bool UPakExportUtility::RunBat(const FString& BatFileAndParams)
 void UPakExportUtility::EnableSimpleCollisions(const TArray<FAssetData>& Assets)
 {
 	for (auto const& SelectedAsset : Assets)
-	{
+	{		
 		const auto AssetName = SelectedAsset.GetFullName();
 		if (!SimpleCollisionCreatedAssets.Contains(AssetName))
 			if (auto StaticMesh = Cast<UStaticMesh>(SelectedAsset.GetAsset()))
 			{
+				SaveAssetCopy(SelectedAsset);
+				
 				SimpleCollisionCreatedAssets.Add(AssetName);
 				if (!StaticMesh->GetBodySetup()) StaticMesh->CreateBodySetup();
 				StaticMesh->GetBodySetup()->CollisionTraceFlag = CTF_UseSimpleAndComplex;
 				StaticMesh->Build();
-				const auto AssetPath = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(
-					*(FPaths::GameSourceDir() + ".."
-						+ SelectedAsset.PackagePath.ToString().Replace(TEXT("/Game/"), TEXT("/Content/"), ESearchCase::CaseSensitive)
-						+ "/" + SelectedAsset.AssetName.ToString() + ".uasset"));
-				const auto AssetPathSaved = AssetPath + SavedPostfix;
-				if (IFileManager::Get().Copy(*AssetPathSaved, *AssetPath) == COPY_OK)
-					SavedAssetsPaths.Add(AssetPathSaved);
-				else
-				{
-					UE_LOG(LogPakExport, Error, TEXT("Save pakages for restore failed! AssetPathSaved %s, AssetPath %s"), *AssetPathSaved, *AssetPath);
-				}
 #if ENGINE_MAJOR_VERSION >= 5
 				GEditor->GetEditorSubsystem<UStaticMeshEditorSubsystem>()->SetConvexDecompositionCollisions(StaticMesh, 16, 16, 100000);
 #else
@@ -1023,7 +1295,7 @@ static void SkinnedMeshToRawMeshes(USkinnedMeshComponent* InSkinnedMeshComponent
 		FRawMeshTracker& RawMeshTracker = OutRawMeshTrackers[OverallLODIndex];
 		const int32 BaseVertexIndex = RawMesh.VertexPositions.Num();
 
-		FSkeletalMeshLODInfo& SrcLODInfo = *(InSkinnedMeshComponent->GetSkinnedAsset()->GetLODInfo(LODIndexRead));
+		FSkeletalMeshLODInfo& SrcLODInfo = *(InSkinnedMeshComponent->SkeletalMesh->GetLODInfo(LODIndexRead));
 
 		// Get the CPU skinned verts for this LOD
 		TArray<FFinalSkinVertex> FinalVertices;
@@ -1105,7 +1377,7 @@ static void SkinnedMeshToRawMeshes(USkinnedMeshComponent* InSkinnedMeshComponent
 				// use the remapping of material indices if there is a valid value
 				if (SrcLODInfo.LODMaterialMap.IsValidIndex(SectionIndex) && SrcLODInfo.LODMaterialMap[SectionIndex] != INDEX_NONE)
 				{
-					MaterialIndex = FMath::Clamp<int32>(SrcLODInfo.LODMaterialMap[SectionIndex], 0, InSkinnedMeshComponent->GetSkinnedAsset()->GetMaterials().Num());
+					MaterialIndex = FMath::Clamp<int32>(SrcLODInfo.LODMaterialMap[SectionIndex], 0, InSkinnedMeshComponent->SkeletalMesh->GetMaterials().Num());
 				}
 
 				// copy face info
@@ -1776,35 +2048,18 @@ void UPakExportUtility::SetAllowCPUAccess(UObject* WorldContextObject, UStaticMe
 	}
 }
 
-TArray<UMaterialInterface*> UPakExportUtility::GetBunchMaterials(const FString& MaterialPackageName)
-{
-	TArray<UMaterialInterface*> Materials;
-	int32 MaterialCount = 0;
-	while (true)
-	{
-		TArray<FAssetData> MaterialAssets;
-		(FModuleManager::Get().LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"))).Get().GetAssetsByPackageName(
-			FName(MaterialCount == 0 ? MaterialPackageName : (MaterialPackageName + FString::FromInt(MaterialCount))), MaterialAssets);
-		if (MaterialAssets.Num() > 0)
-		{
-			Materials.Add(Cast<UMaterialInterface>(MaterialAssets[0].GetAsset()));
-			++MaterialCount;
-		}
-		else
-		{
-			break;
-		}
-	}
-
-	return Materials;
-}
-
 void UPakExportUtility::Export2Pak_Internal(const TArray<FAssetData>& Assets /*= {}*/, const FString& DestinationDir/* = {}*/)
 {
 	if (!SetStarted(true)) return;
+
+	const auto PreSelectedAssets = Assets.Num() == 0 ? UEditorUtilityLibrary::GetSelectedAssetData() : Assets;
+	
+	//MaterialSlotsUnification(PreSelectedAssets);
+	
 	if (MigratePackages(Assets))
 	{
-		if (!CookPak(DestinationDir.IsEmpty() ? FString() : DestinationDir + "/" + Assets[0].AssetName.ToString() + ".pak"))
+		if (!CookPak(DestinationDir.IsEmpty() ? FString() : DestinationDir + "/" + Assets[0].AssetName.ToString() + ".pak"
+			, PreSelectedAssets.Num() > 1 ? FString{} : PreSelectedAssets[0].AssetName.ToString()))
 		{
 			UE_LOG(LogPakExport, Error, TEXT("Cook failed!"));
 		}
@@ -1814,6 +2069,82 @@ void UPakExportUtility::Export2Pak_Internal(const TArray<FAssetData>& Assets /*=
 		UE_LOG(LogPakExport, Error, TEXT("MigratePackages failed!"));
 	}
 	SetStarted(false);
+}
+
+FString UPakExportUtility::GetDestinationFolder()
+{
+	// Choose a destination folder
+	IDesktopPlatform* DesktopPlatform = FDesktopPlatformModule::Get();
+	FString DestinationDir;
+	if (ensure(DesktopPlatform))
+	{
+		TArray<FString> DestinationFiles;
+		const void* ParentWindowWindowHandle = FSlateApplication::Get().FindBestParentWindowHandleForDialogs(nullptr);
+
+		const FString Title = LOCTEXT("MigrateToFolderTitle", "Choose a destination Content folder").ToString();
+		bool bFolderAccepted = false;
+		while (!bFolderAccepted)
+		{
+			const bool bFolderSelected = DesktopPlatform->SaveFileDialog(
+				ParentWindowWindowHandle,
+				Title,
+				FEditorDirectories::Get().GetLastDirectory(ELastDirectory::GENERIC_EXPORT),
+				TEXT("Exported.pak"),
+				TEXT("Pak Files (*.pak)|*.pak"),
+				EFileDialogFlags::None,
+				DestinationFiles
+			);
+
+			if (!bFolderSelected)
+			{
+				// User canceled, return
+				UE_LOG(LogPakExport, Error, TEXT("User canceled, return!"));
+				return {};
+			}
+
+			FString DestinationFile = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*DestinationFiles[0]);
+			DestinationDir = FPaths::GetPath(DestinationFile);
+
+			FEditorDirectories::Get().SetLastDirectory(ELastDirectory::GENERIC_EXPORT, DestinationDir);
+			FPaths::NormalizeFilename(DestinationFile);
+
+			bFolderAccepted = true;
+		}
+	}
+	else
+	{
+		// Not on a platform that supports desktop functionality
+		FMessageDialog::Open(EAppMsgType::Ok, LOCTEXT("NoDesktopPlatform", "Error: This platform does not support a file dialog."));
+		UE_LOG(LogPakExport, Error, TEXT("This platform does not support a file dialog!"));
+		return {};
+	}
+
+	return DestinationDir;
+}
+
+bool UPakExportUtility::UnZip(const FString& Archive, const FString& DestPath)
+{
+#if PLATFORM_WINDOWS
+	return RunBat("UnZip.bat\" " + Quotes + Archive + Quotes + " " + Quotes + DestPath + Quotes);
+#elif PLATFORM_MAC
+	return RunBat("UnZip.sh " + Archive + " " + DestPath);
+#endif
+}
+
+bool UPakExportUtility::Zip(const FString& SourcePath, const FString& DestArchive)
+{
+#if PLATFORM_WINDOWS
+	return RunBat("Zip.bat\" " + Quotes + DestArchive + Quotes + " " + Quotes + SourcePath + Quotes);
+#elif PLATFORM_MAC
+	return RunBat("Zip.sh " + DestArchive + " " + SourcePath);
+#endif
+}
+
+TArray<FString> UPakExportUtility::ParseStringToArray(const FString& Source, const FString& Delim)
+{
+	TArray<FString> Out;
+	Source.ParseIntoArray(Out, *Delim);
+	return Out;
 }
 
 UClass* UPakExportDeveloperSettings::GetMeshOpsActorClass()

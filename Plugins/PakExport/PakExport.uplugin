@@ -18,6 +18,11 @@
 			"Name": "PakExport",
 			"Type": "Editor",
 			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "PakExportRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [
@@ -26,15 +31,15 @@
 			"Enabled": true
 		},
 		{
-			"Name": "PakExportRuntime",
-			"Enabled": true
-		},
-		{
 			"Name": "ProceduralMeshComponent",
 			"Enabled": true
 		},
 		{
 			"Name": "GeometryProcessing",
+			"Enabled": true
+		},
+		{
+			"Name": "PakLoader",
 			"Enabled": true
 		}
 	]

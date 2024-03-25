@@ -22,7 +22,7 @@ int32 UMorphToPakCommandlet::Main(const FString& Params)
   TMap<FString, FString> OutParams;
   ParseCommandLine(*Params, OutTokens, OutSwitches, OutParams);
 
-  UPakExportUtility::MakeBunchFromMorphs("/Game/T_plank_morph2", "/Game/mat_test/01/MS_01_Inst", "/Game/mat_test/02/MS_02_Inst"
+  UPakExportUtility::MakeBunchFromMorphs("/Game/T_plank_morph2", "/Game/mat_test/01/MS_01_Inst"
   ,"/Game/mat_test/03/MS_02_Inst1", "/Game/mat_test/04/MS_02_Inst1", "/Game/Meshes/StaticMesh"
   , { FMorphTargetData("Length", FCString::Atof(*OutParams["Length"]))
   , FMorphTargetData("Width", FCString::Atof(*OutParams["Width"]))
